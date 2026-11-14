@@ -6,11 +6,17 @@
 仅用标准库（zlib 提供 CRC32，json 仅用于输出序列化）。
 
 用法:
-    python3 sparse_rows.py INPUT [OUTPUT]
+    python3 sparse_rows.py [--trace] INPUT [OUTPUT]
 
     INPUT   事件字节流文件，"-" 表示标准输入。
     OUTPUT  JSON 输出文件；省略或 "-" 表示标准输出。给定真实路径时，
             只有整次解析成功才会原子地替换输出文件。
+    --trace 追溯模式：不输出变更数组，改为输出
+            {"min_initial":…, "must_same":…} —— 解释全部行变更历史所需的
+            最少初始行数，以及全部最优解释中必然同属一个行身份的变更对
+            （按行变更原序零基索引的布尔方阵）。追溯按 (库,表) 分组：
+            同组映射的列类型与可空性须一致，每组最多 12 条行变更，
+            超限或不一致即整次拒绝（报相关事件的零基字节起点）。
 
 退出码:
     0  成功（空输入输出 []）。
@@ -425,11 +431,13 @@ def _parse_rows_event(body, event_index, maps, op):
 # 事件流
 # ---------------------------------------------------------------------------
 
-def parse_stream(data):
+def parse_stream(data, tracer=None):
     """解析整段事件字节流，返回 [event, db, table, op, old, new] 列表。
 
     event 为事件的零基序号（TABLE_MAP 也计入）。任一事件非法即整次拒绝，
     抛出 StreamError（offset 为出错事件的零基字节起点）。
+    tracer 非 None 时（追溯模式）对每个表映射/行事件追加流级检查，
+    其抛出的 Reject 同样按出错事件整次拒绝。
     """
     maps = {}
     changes = []
@@ -454,9 +462,14 @@ def parse_stream(data):
             if etype == TABLE_MAP_EVENT:
                 table_id, tmap = _parse_table_map(body)
                 maps[table_id] = tmap  # 按 table_id 替换
+                if tracer is not None:
+                    tracer.on_table_map(tmap)
             elif etype in _OPS:
-                changes.extend(_parse_rows_event(body, event_index, maps,
-                                                 _OPS[etype]))
+                rows = _parse_rows_event(body, event_index, maps,
+                                         _OPS[etype])
+                changes.extend(rows)
+                if tracer is not None:
+                    tracer.on_rows(rows)
             else:
                 raise Reject("unknown event type %d" % etype)
         except Reject as e:
@@ -467,11 +480,187 @@ def parse_stream(data):
 
 
 # ---------------------------------------------------------------------------
+# 追溯：最少初始行数与必然身份关联
+# ---------------------------------------------------------------------------
+
+MAX_TRACE_CHANGES = 12     # 追溯每组（库,表）最多解释的行变更条数
+
+
+class _Tracer:
+    """追溯模式的流级检查：同组映射须一致，每组行变更不得超限。"""
+
+    def __init__(self):
+        self._sigs = {}      # (db, table) -> (列类型元组, 可空元组)
+        self._counts = {}    # (db, table) -> 已计入的行变更数
+
+    def on_table_map(self, tmap):
+        key = (tmap.db, tmap.table)
+        sig = (tuple(tmap.types), tuple(tmap.nullable))
+        prev = self._sigs.get(key)
+        if prev is None:
+            self._sigs[key] = sig
+        elif prev != sig:
+            raise Reject("inconsistent column types or nullability for "
+                         "table %s.%s" % key)
+
+    def on_rows(self, rows):
+        if not rows:
+            return
+        key = (rows[0][1], rows[0][2])
+        total = self._counts.get(key, 0) + len(rows)
+        if total > MAX_TRACE_CHANGES:
+            raise Reject("too many row changes for table %s.%s (limit %d)"
+                         % (key + (MAX_TRACE_CHANGES,)))
+        self._counts[key] = total
+
+
+def _json_equal(x, y):
+    """JSON 递归比较：对象忽略键序，布尔不同于整数。"""
+    if x is None or y is None:
+        return x is None and y is None
+    if isinstance(x, bool) or isinstance(y, bool):
+        return isinstance(x, bool) and isinstance(y, bool) and x == y
+    if isinstance(x, int) or isinstance(y, int):
+        return isinstance(x, int) and isinstance(y, int) and x == y
+    if isinstance(x, str) or isinstance(y, str):
+        return isinstance(x, str) and isinstance(y, str) and x == y
+    if isinstance(x, list) or isinstance(y, list):
+        return (isinstance(x, list) and isinstance(y, list)
+                and len(x) == len(y)
+                and all(_json_equal(a, b) for a, b in zip(x, y)))
+    if isinstance(x, dict) or isinstance(y, dict):
+        return (isinstance(x, dict) and isinstance(y, dict)
+                and set(x) == set(y)
+                and all(_json_equal(x[k], y[k]) for k in x))
+    return False
+
+
+def _tagged_equal(a, b):
+    """镜像值比较：标签参与比较（SQL NULL / int / json 两两不同）。"""
+    if a[0] != b[0]:
+        return False
+    if a[0] == "int":
+        return a[1] == b[1]
+    if a[0] == "json":
+        return _json_equal(a[1], b[1])
+    return True     # "sql"：SQL NULL 只等于 SQL NULL
+
+
+def _chain_valid(items, members):
+    """一条身份链是否合法：members 为递增的变更下标。
+
+    返回 (合法?, 含插入?)。插入必是链首（插入总是新建身份），删除必是
+    链尾（删除的身份不可复用）；旧镜像出现列须与已绑定值相等，未知列
+    据此绑定；更新只覆盖新镜像出现列；未知值跨步骤保持。
+    """
+    has_insert = items[members[0]][0] == "I"
+    state = {}                   # 列号字符串 -> 已绑定的标签值；缺省即未知
+    for pos, m in enumerate(members):
+        op, old, new = items[m]
+        if op == "I":
+            if pos != 0:
+                return False, False
+            state = dict(new)    # 缺列未知
+            continue
+        if op == "D" and pos != len(members) - 1:
+            return False, False
+        for col, v in old.items():
+            if col in state and not _tagged_equal(state[col], v):
+                return False, False
+            state[col] = v       # 未知列据此绑定
+        if op == "U":
+            state.update(new)    # 只覆盖新镜像出现列
+    return True, has_insert
+
+
+def _solve_group(items):
+    """一组（同库表）行变更的追溯解：(最少初始行数, must_same 方阵)。
+
+    任一解释等价于把全部变更划分成若干合法身份链：含插入的链不耗初始行，
+    其余每条链对应一个初始行。n <= 12，用子集 DP 求最优划分；再对每对
+    变更求"分属不同身份"的最小代价，大于最优值即必然同身份。
+    """
+    n = len(items)
+    full = (1 << n) - 1
+    valid = [False] * (1 << n)
+    cost = [0] * (1 << n)
+    for mask in range(1, 1 << n):
+        members = [i for i in range(n) if mask >> i & 1]
+        ok, has_insert = _chain_valid(items, members)
+        valid[mask] = ok
+        cost[mask] = 0 if has_insert else 1
+    # 子集 DP：把全部变更划分成合法身份链，最小化无插入链（初始行）数
+    inf = n + 1
+    f = [inf] * (1 << n)
+    f[0] = 0
+    for mask in range(1, 1 << n):
+        low = mask & (-mask)     # 只枚举含最低位的链，避免重复划分
+        sub = mask
+        while sub:
+            if sub & low and valid[sub]:
+                cand = f[mask ^ sub] + cost[sub]
+                if cand < f[mask]:
+                    f[mask] = cand
+            sub = (sub - 1) & mask
+    best = f[full]
+    # sep[i][j]：i、j 分属不同身份时的最少初始行数；> best 即必然同身份
+    sep = [[inf] * n for _ in range(n)]
+    for mask in range(1, 1 << n):
+        if not valid[mask]:
+            continue
+        base = cost[mask] + f[full ^ mask]
+        if base > best:
+            continue
+        for i in range(n):
+            if not (mask >> i & 1):
+                continue
+            row = sep[i]
+            for j in range(n):
+                if not (mask >> j & 1) and base < row[j]:
+                    row[j] = base
+    same = [[i == j or sep[i][j] > best for j in range(n)]
+            for i in range(n)]
+    return best, same
+
+
+def trace_stream(data):
+    """追溯入口：读取原二进制流（沿用原校验），返回追溯结果。
+
+    返回 {"min_initial": k, "must_same": [[bool]]}：k 为解释全历史的最少
+    初始行数（各组求和）；must_same 按行变更原序零基索引，仅当全部最优
+    解释中两项属于同一身份时才为 true（跨组恒为 false，对角线恒为 true）。
+    同组映射列类型/可空性不一致或任一组行变更超过 12 条即整次拒绝，
+    抛出 StreamError（offset 为相关事件的零基字节起点）。
+    """
+    changes = parse_stream(data, _Tracer())
+    n = len(changes)
+    same = [[i == j for j in range(n)] for i in range(n)]
+    groups = {}
+    for idx, ch in enumerate(changes):
+        groups.setdefault((ch[1], ch[2]), []).append(idx)
+    total = 0
+    for key in groups:
+        idxs = groups[key]
+        items = [(changes[i][3], changes[i][4], changes[i][5])
+                 for i in idxs]
+        k, sub = _solve_group(items)
+        total += k
+        for a, gi in enumerate(idxs):
+            for b, gj in enumerate(idxs):
+                same[gi][gj] = sub[a][b]
+    return {"min_initial": total, "must_same": same}
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
 def main(argv):
     args = argv[1:]
+    trace = False
+    if args and args[0] == "--trace":
+        trace = True
+        args = args[1:]
     if len(args) < 1 or len(args) > 2:
         sys.stderr.write(__doc__)
         return 2
@@ -487,13 +676,13 @@ def main(argv):
         sys.stderr.write("error: cannot read input: %s\n" % e)
         return 2
     try:
-        changes = parse_stream(data)
+        result = trace_stream(data) if trace else parse_stream(data)
     except StreamError as e:
         sys.stderr.write("error: invalid event stream: event #%d "
                          "(byte offset %d): %s\n"
                          % (e.index, e.offset, e.message))
         return 1
-    text = json.dumps(changes, ensure_ascii=False) + "\n"
+    text = json.dumps(result, ensure_ascii=False) + "\n"
     if dst == "-":
         sys.stdout.write(text)
         return 0
